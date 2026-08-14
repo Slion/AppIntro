@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
+import android.view.SoundEffectConstants
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
@@ -27,6 +28,7 @@ import androidx.core.view.WindowInsetsCompat.Type.systemBars
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.updateLayoutParams
 import androidx.fragment.app.Fragment
+import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.github.appintro.indicator.DotIndicatorController
 import com.github.appintro.indicator.IndicatorController
@@ -353,6 +355,34 @@ abstract class AppIntroBase : AppCompatActivity(), AppIntroViewPagerListener {
      */
     protected open fun onPageSelected(position: Int) {}
 
+    /**
+     * Called after a new slide has been selected and the bottom bar buttons
+     * visibility has been updated. Use this to set the D-pad focus of the new slide.
+     *
+     * The default implementation moves the focus to the primary action
+     * button (next, or done on the last slide) on Android TV, so the cursor
+     * doesn't stay on the back/skip button after a slide transition.
+     * If the focus is already on the back button (user tracking back through
+     * the slides with it), the focus is left there.
+     * Override to set a different focus for each slide.
+     *
+     * @param position Position of the newly selected slide
+     */
+    protected open fun onPageSetFocus(position: Int) {
+        // On TV, focus restoration after a slide change can land on the leftmost
+        // bottom bar button (back/skip). Post so it lands after the layout pass.
+        if (packageManager.hasSystemFeature("android.software.leanback")) {
+            window.decorView.post {
+                // Keep the back button focused while the user tracks back through the slides
+                if (currentFocus === backButton) {
+                    return@post
+                }
+                val primaryButton = if (pagerController.isLastSlide(fragments.size)) doneButton else nextButton
+                primaryButton.requestFocus()
+            }
+        }
+    }
+
     /** Called when the user clicked the done button */
     protected open fun onDonePressed(currentFragment: Fragment?) {}
 
@@ -480,6 +510,10 @@ abstract class AppIntroBase : AppCompatActivity(), AppIntroViewPagerListener {
                     null,
                     getPagerItem(pagerController.getCurrentItem()),
                 )
+                // Keep D-pad focus confined to the visible slide (see updateSlideFocusability).
+                // This must run after attach: ViewPager2 only creates its internal
+                // RecyclerView in onAttachedToWindow, which happens after onPostCreate.
+                observeSlideFocusability()
             } else {
                 // Close the intro if there are no slides to show
                 finish()
@@ -542,30 +576,53 @@ abstract class AppIntroBase : AppCompatActivity(), AppIntroViewPagerListener {
 
     private fun initializeIndicator() {
         indicatorContainer.addView(indicatorController?.newInstance(this))
-        indicatorController?.initialize(slidesNumber)
         indicatorController?.selectPosition(currentlySelectedItem)
     }
 
-    override fun onKeyDown(
-        code: Int,
-        event: KeyEvent,
-    ): Boolean {
-        // Handle the navigation with 'Enter' or Dpad events.
-        if (code == KeyEvent.KEYCODE_ENTER ||
-            code == KeyEvent.KEYCODE_BUTTON_A ||
-            code == KeyEvent.KEYCODE_DPAD_CENTER
-        ) {
-            val isLastSlide = pagerController.isLastSlide(fragments.size)
-            goToNextSlide(isLastSlide)
-            if (isLastSlide) {
-                // We emulate the onDonePressed here to keep backward compatibility
-                // with the previous API (users expect an onDonePressed to kill the Activity).
-                // Ideally we should get rid of this extra callback in one of the future release.
-                onDonePressed(getPagerItem(pagerController.getCurrentItem()))
-            }
-            return false
+    /**
+     * Keeps D-pad focus confined to the visible slide.
+     *
+     * Wizard mode keeps every slide alive in the view hierarchy (offscreen page limit), so
+     * D-pad focus search can escape the visible slide and land on an invisible focusable view
+     * of a neighbor slide (e.g. its preference list), which plays the focus-change sound while
+     * nothing shows on screen. Blocking descendant focus on non-current pages keeps the search
+     * on the visible slide, so LEFT/RIGHT fall through to the bottom bar instead.
+     *
+     * Pages are attached and detached as the user swipes, and a freshly attached page defaults
+     * to FOCUS_AFTER_DESCENDANTS, so this must run on every attach/detach, not only when a
+     * page is selected.
+     */
+    private fun updateSlideFocusability() {
+        val recyclerView = (findViewById<ViewPager2>(R.id.view_pager) ?: return)
+            .getChildAt(0) as? RecyclerView ?: return
+        val currentItem = pagerController.getCurrentItem()
+        for (i in 0 until recyclerView.childCount) {
+            // Pages are always ViewGroups, but getChildAt() returns the base View type
+            val page = recyclerView.getChildAt(i) as? ViewGroup ?: continue
+            val isCurrent = recyclerView.getChildAdapterPosition(page) == currentItem
+            page.setDescendantFocusability(
+                if (isCurrent) ViewGroup.FOCUS_AFTER_DESCENDANTS else ViewGroup.FOCUS_BLOCK_DESCENDANTS
+            )
         }
-        return super.onKeyDown(code, event)
+    }
+
+    /**
+     * Keeps [updateSlideFocusability] in sync as slide pages attach to and detach from the
+     * view hierarchy. This fires on the initial layout (when wizard mode attaches the neighbor
+     * pages) and every time a page scrolls in or out, which an adapter-data observer would miss.
+     */
+    private fun observeSlideFocusability() {
+        val recyclerView = (findViewById<ViewPager2>(R.id.view_pager) ?: return)
+            .getChildAt(0) as? RecyclerView ?: return
+        recyclerView.addOnChildAttachStateChangeListener(
+            object : RecyclerView.OnChildAttachStateChangeListener {
+                // A page view was attached to or removed from the hierarchy
+                override fun onChildViewAttachedToWindow(view: View) = updateSlideFocusability()
+                override fun onChildViewDetachedFromWindow(view: View) = updateSlideFocusability()
+            }
+        )
+        // Cover the case where pages are already attached when the listener is registered
+        updateSlideFocusability()
     }
 
     /*
@@ -609,6 +666,40 @@ abstract class AppIntroBase : AppCompatActivity(), AppIntroViewPagerListener {
             backButton.isVisible = false
             skipButton.isVisible = false
         }
+    }
+
+    /*
+     KEY HANDLING
+     =================================== */
+
+    /**
+     * On TV (leanback), pressing DOWN from the last focusable item of a slide
+     * (e.g. the last preference row) would geometrically land on the leftmost
+     * bottom bar button (back/skip). We want the primary action (next/done)
+     * to take focus instead.
+     *
+     * Note: [View.setNextFocusDownId] cannot be used here, the framework only
+     * reads user-specified focus hints from the *focused* view itself, which we
+     * do not control (it is a preference row, not the pager).
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN &&
+            packageManager.hasSystemFeature("android.software.leanback")
+        ) {
+            val focused = currentFocus
+            val defaultTarget = focused?.focusSearch(View.FOCUS_DOWN)
+            val isOnLeftButton = defaultTarget?.id == R.id.back || defaultTarget?.id == R.id.skip
+            if (isOnLeftButton) {
+                val primaryButton = if (pagerController.isLastSlide(fragments.size)) doneButton else nextButton
+                if (primaryButton.requestFocus()) {
+                    // A programmatic requestFocus() does not trigger the D-pad focus
+                    // sound, so play it manually for the usual TV audio feedback
+                    primaryButton.playSoundEffect(SoundEffectConstants.NAVIGATION_DOWN)
+                    return true
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     /*
@@ -843,6 +934,7 @@ abstract class AppIntroBase : AppCompatActivity(), AppIntroViewPagerListener {
 
             // Firing all the necessary Callbacks
             this@AppIntroBase.onPageSelected(position)
+            this@AppIntroBase.onPageSetFocus(position)
             if (slidesNumber > 0) {
                 if (currentlySelectedItem == -1) {
                     dispatchSlideChangedCallbacks(

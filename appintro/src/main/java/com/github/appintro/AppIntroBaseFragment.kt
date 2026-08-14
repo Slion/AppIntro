@@ -147,8 +147,13 @@ abstract class AppIntroBaseFragment : Fragment(), SlideSelectionListener, SlideB
             }
         }
 
-        titleText.movementMethod = ScrollingMovementMethod()
-        descriptionText.movementMethod = ScrollingMovementMethod()
+        // Touch scrolling only makes sense on touch screens; on TV it also makes the
+        // title and description focusable, which steals D-pad focus from the bottom bar
+        val isLeanback = requireContext().packageManager.hasSystemFeature("android.software.leanback")
+        if (!isLeanback) {
+            titleText.movementMethod = ScrollingMovementMethod()
+            descriptionText.movementMethod = ScrollingMovementMethod()
+        }
 
         // Clear system bars
         ViewCompat.setOnApplyWindowInsetsListener(view.findViewById(R.id.inner)) { view, insets ->
